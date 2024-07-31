@@ -1,0 +1,191 @@
+diff --git a/kernel/defs.h b/kernel/defs.h
+index 3564db4..8054fc6 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -170,6 +170,9 @@ uint64          walkaddr(pagetable_t, uint64);
+ int             copyout(pagetable_t, uint64, char *, uint64);
+ int             copyin(pagetable_t, char *, uint64, uint64);
+ int             copyinstr(pagetable_t, char *, uint64, uint64);
++void            vmprint(pagetable_t pagetable,uint dep);
++pte_t *
++walk(pagetable_t pagetable, uint64 va, int alloc);
+ 
+ // plic.c
+ void            plicinit(void);
+diff --git a/kernel/exec.c b/kernel/exec.c
+index d62d29d..fd38c21 100644
+--- a/kernel/exec.c
++++ b/kernel/exec.c
+@@ -115,7 +115,8 @@ exec(char *path, char **argv)
+   p->trapframe->epc = elf.entry;  // initial program counter = main
+   p->trapframe->sp = sp; // initial stack pointer
+   proc_freepagetable(oldpagetable, oldsz);
+-
++  if(p->pid==1)  //for the fork of PID==1
++    vmprint(p->pagetable,0);
+   return argc; // this ends up in a0, the first argument to main(argc, argv)
+ 
+  bad:
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 22e7ce4..9d6c24a 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -126,7 +126,13 @@ found:
+     release(&p->lock);
+     return 0;
+   }
+-
++  // Allocate a usyscall page.
++  if((p->usyscall = (struct usyscall *)kalloc()) == 0){
++    freeproc(p);
++    release(&p->lock);
++    return 0;
++  }
++  p->usyscall->pid=p->pid;
+   // An empty user page table.
+   p->pagetable = proc_pagetable(p);
+   if(p->pagetable == 0){
+@@ -155,6 +161,8 @@ freeproc(struct proc *p)
+   p->trapframe = 0;
+   if(p->pagetable)
+     proc_freepagetable(p->pagetable, p->sz);
++  if(p->usyscall)
++    kfree((void*)p->usyscall);
+   p->pagetable = 0;
+   p->sz = 0;
+   p->pid = 0;
+@@ -195,7 +203,14 @@ proc_pagetable(struct proc *p)
+     uvmfree(pagetable, 0);
+     return 0;
+   }
+-
++  if(mappages(pagetable,USYSCALL,PGSIZE,(uint64)(p->usyscall),PTE_R|PTE_U)<0)
++  {
++    uvmunmap(pagetable,TRAMPOLINE,1,0);
++    uvmunmap(pagetable,TRAPFRAME,1,0);
++    uvmfree(pagetable,0);
++    //kfree(p->usyscall); // release usyscall page 
++    return 0;
++  }
+   return pagetable;
+ }
+ 
+@@ -206,6 +221,7 @@ proc_freepagetable(pagetable_t pagetable, uint64 sz)
+ {
+   uvmunmap(pagetable, TRAMPOLINE, 1, 0);
+   uvmunmap(pagetable, TRAPFRAME, 1, 0);
++  uvmunmap(pagetable,USYSCALL,1,0);  
+   uvmfree(pagetable, sz);
+ }
+ 
+diff --git a/kernel/proc.h b/kernel/proc.h
+index f6ca8b7..b73ffef 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -1,4 +1,5 @@
+ // Saved registers for kernel context switches.
++
+ struct context {
+   uint64 ra;
+   uint64 sp;
+@@ -92,7 +93,7 @@ struct proc {
+   int killed;                  // If non-zero, have been killed
+   int xstate;                  // Exit status to be returned to parent's wait
+   int pid;                     // Process ID
+-
++  
+   // wait_lock must be held when using this:
+   struct proc *parent;         // Parent process
+ 
+@@ -100,6 +101,7 @@ struct proc {
+   uint64 kstack;               // Virtual address of kernel stack
+   uint64 sz;                   // Size of process memory (bytes)
+   pagetable_t pagetable;       // User page table
++  struct usyscall *usyscall;   //for getpid
+   struct trapframe *trapframe; // data page for trampoline.S
+   struct context context;      // swtch() here to run process
+   struct file *ofile[NOFILE];  // Open files
+diff --git a/kernel/riscv.h b/kernel/riscv.h
+index 1691faf..06b104b 100644
+--- a/kernel/riscv.h
++++ b/kernel/riscv.h
+@@ -343,6 +343,7 @@ sfence_vma()
+ #define PTE_W (1L << 2)
+ #define PTE_X (1L << 3)
+ #define PTE_U (1L << 4) // 1 -> user can access
++#define PTE_A (1L << 6) //define access bit
+ 
+ // shift a physical address to the right place for a PTE.
+ #define PA2PTE(pa) ((((uint64)pa) >> 12) << 10)
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index 3bd0007..2dce73c 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -81,7 +81,39 @@ int
+ sys_pgaccess(void)
+ {
+   // lab pgtbl: your code here.
+-  return 0;
++  //get user's information
++  
++  struct proc *p=myproc();  //userpage
++  uint64 firstAddr;  //the first location of userpage
++  int numpage;  //number of pages
++  uint64 outAddr;  //the location to store the result
++  //get user's information
++  //try(argaddr(0,&firstAddr),return -1);
++  if(argaddr(0,&firstAddr)!=0)return -1;  //printf("pgacess:argaddr");
++  //try(argint(1,&ckSize),return -1);
++  if(argint(1,&numpage)!=0)return -1;//printf("pgacess:argint");
++  //try(argaddr(2,&maskAddr),return -1);
++  if(argaddr(2,&outAddr)!=0)return -1;//printf("pgacess:argaddr");
++
++  if(p->pagetable==0||numpage>32)return -1;
++  if(outAddr+4>=MAXVA || firstAddr+numpage*PGSIZE>=MAXVA){
++    return -1;
++  }
++
++
++  uint32 bitmap=0;  //mask the visited bit
++  uint64 s=PGROUNDDOWN(firstAddr);
++  for(int i=0;i<numpage&&s<MAXVA;i++,s+=PGSIZE){
++    pte_t* pte=walk(p->pagetable,s,0);  //return leave
++    if((*pte&PTE_A)&&pte!=0)  //affective and have beed visited
++    {
++      bitmap|=(1<<i);  //set tag of the pte_t visited
++      *pte=*pte & (~PTE_A);  //reset firstPate[i]
++    }
++  }
++  //try(copyout(userpt,(uint64)maskAddr,&mask,sizeof(uint)),return -1); 
++  copyout(p->pagetable,outAddr,(char *)&bitmap,4) ;
++  return 0;//copy to user's space
+ }
+ #endif
+ 
+diff --git a/kernel/vm.c b/kernel/vm.c
+index d5a12a0..a7a7b5d 100644
+--- a/kernel/vm.c
++++ b/kernel/vm.c
+@@ -432,3 +432,22 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
+     return -1;
+   }
+ }
++static int pageMaxNum=512;
++void 
++vmprint(pagetable_t pagetable,uint dep)
++{
++  if(dep==0)
++    printf("page table %p\n",pagetable);
++  for(int i=0;i<pageMaxNum;i++){
++    pte_t pte=pagetable[i];  //page table entries
++    if(pte&PTE_V){
++      for(int j=0;j<dep;j++){  //show depth
++        printf("..");
++      }
++      uint64 child=PTE2PA(pte);  //physical address PA
++      printf("..%d: pte %p pa %p\n",i,pte,child);  //i=num of page
++      if(dep<2)  //XV6 use three-level page table
++        vmprint((pagetable_t)child,dep+1);
++    }
++  }
++}
