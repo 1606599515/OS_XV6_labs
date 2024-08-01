@@ -1,0 +1,449 @@
+diff --git a/Makefile b/Makefile
+index 7a7e380..fa4b9d0 100644
+--- a/Makefile
++++ b/Makefile
+@@ -188,7 +188,7 @@ UPROGS=\
+ 	$U/_grind\
+ 	$U/_wc\
+ 	$U/_zombie\
+-
++        $U/_mmaptest\
+ 
+ 
+ 
+diff --git a/grade-lab-mmap b/grade-lab-mmap
+index cd16700..56b93a4 100755
+--- a/grade-lab-mmap
++++ b/grade-lab-mmap
+@@ -47,7 +47,7 @@ def test_mmaptest_fork_test():
+ def test_usertests():
+     r.run_qemu(shell_script([
+         'usertests'
+-    ]), timeout=420)
++    ]), timeout=900)
+     r.match('^ALL TESTS PASSED$')
+ 
+ @test(1, "time")
+diff --git a/kernel/defs.h b/kernel/defs.h
+index 3564db4..5898c4d 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -1,3 +1,4 @@
++#include "fcntl.h"
+ struct buf;
+ struct context;
+ struct file;
+@@ -184,3 +185,7 @@ void            virtio_disk_intr(void);
+ 
+ // number of elements in fixed-size array
+ #define NELEM(x) (sizeof(x)/sizeof((x)[0]))
++/*#define PROT_READ  0x1
++#define PROT_WRITE 0x2
++#define PROT_EXEC  0x4
++#define PROT_NONE  0x0   */
+diff --git a/kernel/file.h b/kernel/file.h
+index b076d1d..56ae110 100644
+--- a/kernel/file.h
++++ b/kernel/file.h
+@@ -1,3 +1,4 @@
++
+ struct file {
+   enum { FD_NONE, FD_PIPE, FD_INODE, FD_DEVICE } type;
+   int ref; // reference count
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 22e7ce4..ea2514b 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -140,7 +140,7 @@ found:
+   memset(&p->context, 0, sizeof(p->context));
+   p->context.ra = (uint64)forkret;
+   p->context.sp = p->kstack + PGSIZE;
+-
++  memset(&p->vma, 0, sizeof(p->vma));  //for each byte of p->vma,the content =0
+   return p;
+ }
+ 
+@@ -300,7 +300,13 @@ fork(void)
+     if(p->ofile[i])
+       np->ofile[i] = filedup(p->ofile[i]);
+   np->cwd = idup(p->cwd);
+-
++   // copy all of VMA from parent- lab10
++  for(i = 0; i < NVMA; ++i) {
++    if(p->vma[i].used) {
++      memmove(&np->vma[i], &p->vma[i], sizeof(p->vma[i]));  //copy
++      filedup(p->vma[i].vfile);  //add the reference of file
++    }
++  }
+   safestrcpy(np->name, p->name, sizeof(p->name));
+ 
+   pid = np->pid;
+@@ -333,6 +339,7 @@ reparent(struct proc *p)
+   }
+ }
+ 
++#define MAP_SHARED 0x01  // 共享映射
+ // Exit the current process.  Does not return.
+ // An exited process remains in the zombie state
+ // until its parent calls wait().
+@@ -343,7 +350,6 @@ exit(int status)
+ 
+   if(p == initproc)
+     panic("init exiting");
+-
+   // Close all open files.
+   for(int fd = 0; fd < NOFILE; fd++){
+     if(p->ofile[fd]){
+@@ -352,7 +358,18 @@ exit(int status)
+       p->ofile[fd] = 0;
+     }
+   }
+-
++// unmap all mapped virtual memary areas of the current process
++  for(int i = 0; i < NVMA; ++i) {
++    if(p->vma[i].used) {  //the virtual mem is used
++      if(p->vma[i].flags == MAP_SHARED && (p->vma[i].prot & PROT_WRITE) != 0)    
++      {  //shared and writeble
++        filewrite(p->vma[i].vfile, p->vma[i].addr, p->vma[i].len); //writeback
++      }
++      fileclose(p->vma[i].vfile);
++      uvmunmap(p->pagetable, p->vma[i].addr, p->vma[i].len / PGSIZE, 1);
++      p->vma[i].used = 0;
++    }
++  }
+   begin_op();
+   iput(p->cwd);
+   end_op();
+diff --git a/kernel/proc.h b/kernel/proc.h
+index f6ca8b7..4307977 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -82,6 +82,18 @@ struct trapframe {
+ 
+ enum procstate { UNUSED, USED, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
+ 
++#define NVMA 16  //for lab10
++// Virtual Memory Area - lab10
++struct vm_area {
++    int used;  //if it is used
++    uint64 addr;    // mmap address at start
++    int len;    // mmap memory length
++    int prot;   // permission
++    int flags;  // the mmap flags
++    int vfd;  //file descriptor
++    int offset; // the file offset,=0 in this lab
++    struct file* vfile;     // pointer to the mapped file
++};
+ // Per-process state
+ struct proc {
+   struct spinlock lock;
+@@ -105,4 +117,5 @@ struct proc {
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++  struct vm_area vma[NVMA];
+ };
+diff --git a/kernel/riscv.h b/kernel/riscv.h
+index 1691faf..41ac91b 100644
+--- a/kernel/riscv.h
++++ b/kernel/riscv.h
+@@ -343,6 +343,7 @@ sfence_vma()
+ #define PTE_W (1L << 2)
+ #define PTE_X (1L << 3)
+ #define PTE_U (1L << 4) // 1 -> user can access
++#define PTE_D (1L << 7)  //dirty flag for lab10
+ 
+ // shift a physical address to the right place for a PTE.
+ #define PA2PTE(pa) ((((uint64)pa) >> 12) << 10)
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index c1b3670..ff7a516 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -104,6 +104,8 @@ extern uint64 sys_unlink(void);
+ extern uint64 sys_wait(void);
+ extern uint64 sys_write(void);
+ extern uint64 sys_uptime(void);
++extern uint64 sys_mmap(void);
++extern uint64 sys_munmap(void);
+ 
+ static uint64 (*syscalls[])(void) = {
+ [SYS_fork]    sys_fork,
+@@ -127,6 +129,9 @@ static uint64 (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_mmap]  sys_mmap,
++[SYS_munmap]  sys_munmap,
++
+ };
+ 
+ void
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index bc5f356..e7b18d6 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,3 +20,5 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_mmap   22
++#define SYS_munmap 23
+diff --git a/kernel/sysfile.c b/kernel/sysfile.c
+index 5dc453b..a72ebf0 100644
+--- a/kernel/sysfile.c
++++ b/kernel/sysfile.c
+@@ -484,3 +484,88 @@ sys_pipe(void)
+   }
+   return 0;
+ }
++// lab10
++uint64
++sys_mmap(void) {
++  uint64 addr;
++  int length;
++  int prot;  //protecting signal
++  int flags;
++  int vfd;
++  struct file* vfile;
++  int offset;
++  uint64 err = 0xffffffffffffffff;  //to signal error
++
++  // to get the syscall parameter
++  if(argaddr(0, &addr) < 0 || argint(1, &length) < 0 || argint(2, &prot) < 0 ||
++    argint(3, &flags) < 0 || argfd(4, &vfd, &vfile) < 0 || argint(5, &offset) < 0)
++    return err;  //read in failure
++
++  // in this lab,addr and offset=0
++  if(addr != 0 || offset != 0 || length < 0)
++    return err;
++
++  // 
++  if(vfile->writable == 0 && (prot & PROT_WRITE) != 0 && flags == MAP_SHARED)  //file unwriteable,request prot to write,can be shared
++    return err;
++
++  struct proc* p = myproc();
++  if(p->sz + length > MAXVA)  //haven't enough virtual address space
++    return err;
++
++  for(int i = 0; i < NVMA; i++) {
++    if(p->vma[i].used == 0) {  //find a not used vma
++      p->vma[i].used = 1;
++      p->vma[i].addr = p->sz;  //sz: Size of process memory (bytes) put vma behind the proc
++      p->vma[i].len = length;
++      p->vma[i].flags = flags;
++      p->vma[i].prot = prot;
++      p->vma[i].vfile = vfile;
++      p->vma[i].vfd = vfd;
++      p->vma[i].offset = offset;
++
++      // add the count of the file reference
++      filedup(vfile);
++
++      p->sz += length;
++      return p->vma[i].addr;
++    }
++  }
++  return err;
++}
++uint64
++sys_munmap(void) {
++  uint64 addr;
++  int length;
++  if(argaddr(0, &addr) < 0 || argint(1, &length) < 0)return -1;
++  int i;
++  struct proc* p = myproc();
++  for(i = 0; i < NVMA; i++) {
++    if(p->vma[i].used && p->vma[i].len >= length) 
++    {
++      if(p->vma[i].addr == addr) //the start location
++      {
++        p->vma[i].addr += length;
++        p->vma[i].len -= length;
++        break;
++      }
++      if(addr + length == p->vma[i].addr + p->vma[i].len) //the end location
++      {
++        p->vma[i].len -= length;
++        break;
++      }
++    }
++  }
++  if(i == NVMA)return -1;  //munmmap error
++  if(p->vma[i].flags == MAP_SHARED && (p->vma[i].prot & PROT_WRITE) != 0) {
++    filewrite(p->vma[i].vfile, addr, length);  //is shared and writeable,so writeback
++  }
++  uvmunmap(p->pagetable, addr, length / PGSIZE, 1);  //pagetable,the start location,the number of page,whether to force unmap
++
++  if(p->vma[i].len == 0) //whether the vma is deleted
++  {
++    fileclose(p->vma[i].vfile);
++    p->vma[i].used = 0;
++  }
++  return 0;
++}
+diff --git a/kernel/trap.c b/kernel/trap.c
+index a63249e..8e74b9f 100644
+--- a/kernel/trap.c
++++ b/kernel/trap.c
+@@ -6,6 +6,17 @@
+ #include "proc.h"
+ #include "defs.h"
+ 
++struct file {
++  enum { FD_NONE, FD_PIPE, FD_INODE, FD_DEVICE } type;
++  int ref; // reference count
++  char readable;
++  char writable;
++  struct pipe *pipe; // FD_PIPE
++  struct inode *ip;  // FD_INODE and FD_DEVICE
++  uint off;          // FD_INODE
++  short major;       // FD_DEVICE
++};
++
+ struct spinlock tickslock;
+ uint ticks;
+ 
+@@ -29,6 +40,46 @@ trapinithart(void)
+   w_stvec((uint64)kernelvec);
+ }
+ 
++int mmap_handler(int va, int cause) 
++{
++  int i;
++  struct proc* p = myproc();
++  for(i = 0; i < NVMA; ++i) {  //find the proc is from which vma
++    if(p->vma[i].used && p->vma[i].addr <= va && va <= p->vma[i].addr + p->vma[i].len - 1)break;
++  }
++  if(i == NVMA)return -1;  //not found
++
++  int pte_flags = PTE_U;  //user's prot 
++  //set page table entry flags
++  if(p->vma[i].prot & PROT_READ) pte_flags |= PTE_R;
++  if(p->vma[i].prot & PROT_WRITE) pte_flags |= PTE_W;
++  if(p->vma[i].prot & PROT_EXEC) pte_flags |= PTE_X;
++
++  struct file* vf = p->vma[i].vfile;  //filepoint
++  if(cause == 13 && vf->readable == 0) return -1;  //can't read but read
++  if(cause == 15 && vf->writable == 0) return -1;  //can't write but write
++
++  void* pa = kalloc();  //alloc for physical memory
++  if(pa == 0)
++    return -1;
++  memset(pa, 0, PGSIZE);  //init the mem
++
++  ilock(vf->ip);  //get file lock
++  int offset = p->vma[i].offset + PGROUNDDOWN(va - p->vma[i].addr);  //offset=va
++  int readbytes = readi(vf->ip, 0, (uint64)pa, offset, PGSIZE);  //put what can be read in pa
++  if(readbytes == 0) {  //read error
++    iunlock(vf->ip);
++    kfree(pa);
++    return -1;
++  }
++  iunlock(vf->ip);
++
++  if(mappages(p->pagetable, PGROUNDDOWN(va), PGSIZE, (uint64)pa, pte_flags) != 0) {  //add page mapping:pa and va
++    kfree(pa);
++    return -1;
++  }
++  return 0;
++}
+ //
+ // handle an interrupt, exception, or system call from user space.
+ // called from trampoline.S
+@@ -65,7 +116,20 @@ usertrap(void)
+     intr_on();
+ 
+     syscall();
+-  } else if((which_dev = devintr()) != 0){
++  } 
++  else if(r_scause() == 13 || r_scause() == 15) {  //read error or write error
++#ifdef LAB_MMAP
++    uint64 fault_va = r_stval();  //get the virtual address
++    if(PGROUNDUP(p->trapframe->sp) - 1 < fault_va && fault_va < p->sz) //bigger than the top of stack,smaller than proc size
++    {
++      if(mmap_handler(r_stval(), r_scause()) != 0) p->killed = 1;  //kill the proc
++    }
++    else
++      p->killed = 1;
++#endif
++  }
++  
++  else if((which_dev = devintr()) != 0){
+     // ok
+   } else {
+     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
+diff --git a/kernel/vm.c b/kernel/vm.c
+index d5a12a0..56e77f6 100644
+--- a/kernel/vm.c
++++ b/kernel/vm.c
+@@ -175,9 +175,15 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
+     if((pte = walk(pagetable, a, 0)) == 0)
+       panic("uvmunmap: walk");
+     if((*pte & PTE_V) == 0)
++    {
++      continue;
+       panic("uvmunmap: not mapped");
++    }
+     if(PTE_FLAGS(*pte) == PTE_V)
++    {
++      continue;
+       panic("uvmunmap: not a leaf");
++    }
+     if(do_free){
+       uint64 pa = PTE2PA(*pte);
+       kfree((void*)pa);
+@@ -309,7 +315,10 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
+     if((pte = walk(old, i, 0)) == 0)
+       panic("uvmcopy: pte should exist");
+     if((*pte & PTE_V) == 0)
++    {
++      continue;
+       panic("uvmcopy: page not present");
++    }
+     pa = PTE2PA(*pte);
+     flags = PTE_FLAGS(*pte);
+     if((mem = kalloc()) == 0)
+@@ -432,3 +441,22 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
+     return -1;
+   }
+ }
++// get the dirty flag of the va's PTE - lab10
++int uvmgetdirty(pagetable_t pagetable, uint64 va) {
++  pte_t *pte = walk(pagetable, va, 0);
++  if(pte == 0) {
++    return 0;
++  }
++  return (*pte & PTE_D);
++}
++
++// set the dirty flag and write flag of the va's PTE - lab10
++int uvmsetdirtywrite(pagetable_t pagetable, uint64 va) {
++  pte_t *pte = walk(pagetable, va, 0);
++  if(pte == 0) {
++    return -1;
++  }
++  *pte |= PTE_D | PTE_W;
++  return 0;
++}
++
+diff --git a/user/user.h b/user/user.h
+index b71ecda..c8f478d 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -40,3 +40,6 @@ void free(void*);
+ int atoi(const char*);
+ int memcmp(const void *, const void *, uint);
+ void *memcpy(void *, const void *, uint);
++void *mmap(void *addr, int length, int prot, int flags,
++int fd, int offset);
++int munmap(void *addr,int length);
+diff --git a/user/usys.pl b/user/usys.pl
+index 01e426e..d23b9cc 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -36,3 +36,5 @@ entry("getpid");
+ entry("sbrk");
+ entry("sleep");
+ entry("uptime");
++entry("mmap");
++entry("munmap");
