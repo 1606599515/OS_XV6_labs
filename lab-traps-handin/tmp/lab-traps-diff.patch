@@ -1,0 +1,310 @@
+diff --git a/Makefile b/Makefile
+index 7a7e380..c7a3eaa 100644
+--- a/Makefile
++++ b/Makefile
+@@ -188,8 +188,7 @@ UPROGS=\
+ 	$U/_grind\
+ 	$U/_wc\
+ 	$U/_zombie\
+-
+-
++        $U/_alarmtest\
+ 
+ 
+ ifeq ($(LAB),$(filter $(LAB), lock))
+diff --git a/kernel/defs.h b/kernel/defs.h
+index 3564db4..55b3747 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -8,6 +8,7 @@ struct spinlock;
+ struct sleeplock;
+ struct stat;
+ struct superblock;
++struct trapframe;
+ 
+ // bio.c
+ void            binit(void);
+@@ -80,7 +81,7 @@ int             pipewrite(struct pipe*, uint64, int);
+ void            printf(char*, ...);
+ void            panic(char*) __attribute__((noreturn));
+ void            printfinit(void);
+-
++void            backtrace(void);  //for lab4 test2
+ // proc.c
+ int             cpuid(void);
+ void            exit(int);
+@@ -145,7 +146,7 @@ void            trapinit(void);
+ void            trapinithart(void);
+ extern struct spinlock tickslock;
+ void            usertrapret(void);
+-
++void            switchTrapframe(struct trapframe*,struct trapframe*);
+ // uart.c
+ void            uartinit(void);
+ void            uartintr(void);
+diff --git a/kernel/printf.c b/kernel/printf.c
+index e1347de..45c0d2a 100644
+--- a/kernel/printf.c
++++ b/kernel/printf.c
+@@ -121,6 +121,7 @@ panic(char *s)
+   printf("panic: ");
+   printf(s);
+   printf("\n");
++  backtrace();  //add backtrace for lab4 test2
+   panicked = 1; // freeze uart output from other CPUs
+   for(;;)
+     ;
+@@ -132,3 +133,19 @@ printfinit(void)
+   initlock(&pr.lock, "pr");
+   pr.locking = 1;
+ }
++
++void
++backtrace(void)
++{
++  uint64 firstfp=r_fp();  //get the fp
++  uint64 top=PGROUNDUP(firstfp);  //the next page address
++  uint64 bottom = PGROUNDDOWN(firstfp);  //the current page firstaddress
++  printf("backtrace:\n");
++  uint64 fp=firstfp;
++  while(fp<top&&fp>=bottom)
++  {
++    uint64 currAddr=fp-8;  //the current faddr
++    printf("%p\n",*(uint64*)currAddr);
++    fp=*((uint64*)(fp-16));  //go to the last fp
++  }
++}
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 22e7ce4..2436931 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -119,14 +119,18 @@ allocproc(void)
+ found:
+   p->pid = allocpid();
+   p->state = USED;
+-
++  p->spend=0;  //for lab4 test3
++  if((p->preSavedtf = (struct trapframe *)kalloc()) == 0){  //for lab4 test3  
++    release(&p->lock);  
++    return 0;
++  }
+   // Allocate a trapframe page.
+   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
+-    freeproc(p);
+-    release(&p->lock);
++    freeproc(p);  
++    release(&p->lock);  
+     return 0;
+   }
+-
++  
+   // An empty user page table.
+   p->pagetable = proc_pagetable(p);
+   if(p->pagetable == 0){
+@@ -152,6 +156,8 @@ freeproc(struct proc *p)
+ {
+   if(p->trapframe)
+     kfree((void*)p->trapframe);
++  if(p->preSavedtf)  //for lab4 test3
++    kfree((void*)p->preSavedtf);
+   p->trapframe = 0;
+   if(p->pagetable)
+     proc_freepagetable(p->pagetable, p->sz);
+diff --git a/kernel/proc.h b/kernel/proc.h
+index f6ca8b7..dc2dc31 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -105,4 +105,9 @@ struct proc {
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++  uint64 interval;             //alarm interval time
++  void (*handler)();           //alarm handle function
++  uint64 spend;                //the number of ticks have passed since the last call
++  struct trapframe *preSavedtf;  //saved interrupted code related trapframe
++  int waitReturn;  //waiting:return 1,not waiting:return 0
+ };
+diff --git a/kernel/riscv.h b/kernel/riscv.h
+index 1691faf..bb364fc 100644
+--- a/kernel/riscv.h
++++ b/kernel/riscv.h
+@@ -331,6 +331,13 @@ sfence_vma()
+   asm volatile("sfence.vma zero, zero");
+ }
+ 
++static inline uint64  
++r_fp()  
++{  
++  uint64 x;  
++  asm volatile("mv %0, s0" : "=r" (x) );  
++  return x;  
++}
+ 
+ #define PGSIZE 4096 // bytes per page
+ #define PGSHIFT 12  // bits of offset within a page
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index c1b3670..24bfccd 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -104,6 +104,8 @@ extern uint64 sys_unlink(void);
+ extern uint64 sys_wait(void);
+ extern uint64 sys_write(void);
+ extern uint64 sys_uptime(void);
++extern uint64 sys_sigalarm(void);
++extern uint64 sys_sigreturn(void);
+ 
+ static uint64 (*syscalls[])(void) = {
+ [SYS_fork]    sys_fork,
+@@ -127,6 +129,8 @@ static uint64 (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_sigalarm] sys_sigalarm,
++[SYS_sigreturn] sys_sigreturn,
+ };
+ 
+ void
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index bc5f356..bf5f9de 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,3 +20,6 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_sigalarm 22
++#define SYS_sigreturn 23
++
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index e8bcda9..d5e8784 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -70,6 +70,7 @@ sys_sleep(void)
+     sleep(&ticks, &tickslock);
+   }
+   release(&tickslock);
++  backtrace();  //add backtrace for lab4 test2
+   return 0;
+ }
+ 
+@@ -95,3 +96,23 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++uint64 
++sys_sigalarm(void)
++{
++  struct proc* p=myproc();
++  int num;  //define the num of dida input
++  uint64 handler;  //define the function input
++  if(argint(0,&num)<0)return -1;
++  if(argaddr(1,&handler)<0)return -1;  //get the input
++  p->interval=num;
++  p->handler=(void(*)())handler;  //give parameters to the current proc
++  return 0;
++}
++uint64 
++sys_sigreturn(void)
++{
++  struct proc *p=myproc();
++  switchTrapframe(p->trapframe,p->preSavedtf);  //return from a interrupt
++  p->waitReturn=0;  //no waiting
++  return 0;
++}
+diff --git a/kernel/trap.c b/kernel/trap.c
+index a63249e..8fa0a1a 100644
+--- a/kernel/trap.c
++++ b/kernel/trap.c
+@@ -28,7 +28,44 @@ trapinithart(void)
+ {
+   w_stvec((uint64)kernelvec);
+ }
+-
++void switchTrapframe(struct trapframe *trapframe,struct trapframe *preSavedtf)
++{
++  trapframe->kernel_satp=preSavedtf->kernel_satp;
++  trapframe->kernel_sp=preSavedtf->kernel_sp;
++  trapframe->epc=preSavedtf->epc;
++  trapframe->kernel_hartid=preSavedtf->kernel_hartid;
++  trapframe->ra=preSavedtf->ra;
++  trapframe->sp=preSavedtf->sp;
++  trapframe->gp=preSavedtf->gp;
++  trapframe->tp=preSavedtf->tp;
++  trapframe->t0=preSavedtf->t0;
++  trapframe->t1=preSavedtf->t1;
++  trapframe->t2=preSavedtf->t2;
++  trapframe->s0=preSavedtf->s0;
++  trapframe->s1=preSavedtf->s1;
++  trapframe->a0=preSavedtf->a0;
++  trapframe->a1=preSavedtf->a1;
++  trapframe->a2=preSavedtf->a2;
++  trapframe->a3=preSavedtf->a3;
++  trapframe->a4=preSavedtf->a4;
++  trapframe->a5=preSavedtf->a5;
++  trapframe->a6=preSavedtf->a6;
++  trapframe->a7=preSavedtf->a7;
++  trapframe->s2=preSavedtf->s2;
++  trapframe->s3=preSavedtf->s3;
++  trapframe->s4=preSavedtf->s4;
++  trapframe->s5=preSavedtf->s5;
++  trapframe->s6=preSavedtf->s6;
++  trapframe->s7=preSavedtf->s7;
++  trapframe->s8=preSavedtf->s8;
++  trapframe->s9=preSavedtf->s9;
++  trapframe->s10=preSavedtf->s10;
++  trapframe->s11=preSavedtf->s11;
++  trapframe->t3=preSavedtf->t3;
++  trapframe->t4=preSavedtf->t4;
++  trapframe->t5=preSavedtf->t5;
++  trapframe->t6=preSavedtf->t6;
++}
+ //
+ // handle an interrupt, exception, or system call from user space.
+ // called from trampoline.S
+@@ -67,7 +104,22 @@ usertrap(void)
+     syscall();
+   } else if((which_dev = devintr()) != 0){
+     // ok
+-  } else {
++    if(which_dev==2&&p->waitReturn==0)  //time interrupt
++    {
++      if(p->interval!=0)
++      {
++        p->spend=p->spend+1;
++        if(p->spend==p->interval)
++        {
++        switchTrapframe(p->preSavedtf,p->trapframe);
++        p->spend=0;
++        p->trapframe->epc=(uint64)p->handler;  //switch to handler function
++        p->waitReturn=1;
++        }
++      }
++    }
++  } 
++  else {
+     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
+     printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
+     p->killed = 1;
+diff --git a/user/user.h b/user/user.h
+index b71ecda..e035452 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -23,6 +23,8 @@ int getpid(void);
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int sigalarm(int ticks,void (*handler)());
++int sigreturn(void);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff --git a/user/usys.pl b/user/usys.pl
+index 01e426e..fa548b0 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -36,3 +36,5 @@ entry("getpid");
+ entry("sbrk");
+ entry("sleep");
+ entry("uptime");
++entry("sigalarm");
++entry("sigreturn");
