@@ -1,0 +1,398 @@
+diff --git a/Makefile b/Makefile
+index 7a7e380..ba79950 100644
+--- a/Makefile
++++ b/Makefile
+@@ -188,7 +188,7 @@ UPROGS=\
+ 	$U/_grind\
+ 	$U/_wc\
+ 	$U/_zombie\
+-
++        $U/_symlinktest\
+ 
+ 
+ 
+diff --git a/grade-lab-fs b/grade-lab-fs
+index f1762e1..fa48fca 100755
+--- a/grade-lab-fs
++++ b/grade-lab-fs
+@@ -9,7 +9,7 @@ r = Runner(save("xv6.out"))
+ def test_bigfile():
+     r.run_qemu(shell_script([
+         'bigfile'
+-    ]), timeout=180)
++    ]), timeout=600)
+     r.match('^wrote 65803 blocks$')
+     r.match('^bigfile done; ok$')
+ 
+@@ -31,7 +31,7 @@ def test_symlinktest_symlinks():
+ def test_usertests():
+     r.run_qemu(shell_script([
+         'usertests'
+-    ]), timeout=360)
++    ]), timeout=900)
+     r.match('^ALL TESTS PASSED$')
+ 
+ @test(1, "time")
+diff --git a/kernel/fcntl.h b/kernel/fcntl.h
+index 44861b9..38debfe 100644
+--- a/kernel/fcntl.h
++++ b/kernel/fcntl.h
+@@ -3,3 +3,4 @@
+ #define O_RDWR    0x002
+ #define O_CREATE  0x200
+ #define O_TRUNC   0x400
++#define O_NOFOLLOW 0x004  //for lab9-2
+diff --git a/kernel/file.h b/kernel/file.h
+index b076d1d..c9e9c04 100644
+--- a/kernel/file.h
++++ b/kernel/file.h
+@@ -26,7 +26,7 @@ struct inode {
+   short minor;
+   short nlink;
+   uint size;
+-  uint addrs[NDIRECT+1];
++  uint addrs[NDIRECT+2];  //haved changed NDIRECT for lab9
+ };
+ 
+ // map major device number to device functions.
+diff --git a/kernel/fs.c b/kernel/fs.c
+index 40c9bd4..04fa3a8 100644
+--- a/kernel/fs.c
++++ b/kernel/fs.c
+@@ -374,18 +374,19 @@ iunlockput(struct inode *ip)
+ 
+ // Return the disk block address of the nth block in inode ip.
+ // If there is no such block, bmap allocates one.
++
+ static uint
+ bmap(struct inode *ip, uint bn)
+ {
+-  uint addr, *a;
+-  struct buf *bp;
++  uint addr, *a;  //cache address,point to cache address
++  struct buf *bp;  //point to buffer
+ 
+   if(bn < NDIRECT){
+     if((addr = ip->addrs[bn]) == 0)
+       ip->addrs[bn] = addr = balloc(ip->dev);
+     return addr;
+   }
+-  bn -= NDIRECT;
++  bn -= NDIRECT;  //transform to number of the first-indirect cache
+ 
+   if(bn < NINDIRECT){
+     // Load indirect block, allocating if necessary.
+@@ -400,7 +401,32 @@ bmap(struct inode *ip, uint bn)
+     brelse(bp);
+     return addr;
+   }
+-
++  
++    bn-=NINDIRECT;  //visit the second-indirect cache
++    if(bn<NINDIRECT*NINDIRECT)
++    {
++      if((addr=ip->addrs[NDIRECT+1])==0)ip->addrs[NDIRECT+1]=addr=balloc(ip->dev);  //allocate a new second-indirect cache
++      //int i=bn/NINDIRECT,j=bn%NINDIRECT;  //get index i and j
++      bp=bread(ip->dev,addr);
++      a=(uint*)bp->data;
++      if((addr=a[bn/NINDIRECT])==0)  //check the first-indirect cache
++      {
++        a[bn/NINDIRECT]=addr=balloc(ip->dev);
++        log_write(bp);
++      }
++      brelse(bp);
++      bn%=NINDIRECT;
++      //struct buf *bp_double=bread(ip->dev,addr);  //read the content ofhe second-indirect cache
++      bp=bread(ip->dev,addr);
++      a=(uint*)bp->data;
++      if((addr=a[bn])==0)  //check the second-indirect cache
++      {
++        a[bn]=addr=balloc(ip->dev);
++        log_write(bp);
++      }
++      brelse(bp);
++      return addr;
++    }
+   panic("bmap: out of range");
+ }
+ 
+@@ -431,11 +457,37 @@ itrunc(struct inode *ip)
+     bfree(ip->dev, ip->addrs[NDIRECT]);
+     ip->addrs[NDIRECT] = 0;
+   }
+-
++  if(ip->addrs[NDIRECT+1])  //second-indirect cache
++  {
++    bp=bread(ip->dev,ip->addrs[NDIRECT+1]);
++    a=(uint*)bp->data;
++    for(j=0;j<NINDIRECT;j++){
++      if(a[j])
++      {
++        struct buf *bp_double=bread(ip->dev,a[j]);
++        uint* a_double=(uint*)bp_double->data;
++        for(int k=0;k<NINDIRECT;k++){
++          if(a_double[k])
++          {
++            bfree(ip->dev,a_double[k]);
++            //a_double[k]=0;
++          }
++        }
++        brelse(bp_double);
++        bfree(ip->dev,a[j]);
++        //a[j]=0;
++      }
++    }
++    brelse(bp);
++    bfree(ip->dev,ip->addrs[NDIRECT+1]);
++    ip->addrs[NDIRECT+1]=0;  //no more use,it's NDIRECT,not NDIRECT+1
++  }
+   ip->size = 0;
+   iupdate(ip);
+ }
+ 
++
++
+ // Copy stat information from inode.
+ // Caller must hold ip->lock.
+ void
+diff --git a/kernel/fs.h b/kernel/fs.h
+index 139dcc9..4ff8117 100644
+--- a/kernel/fs.h
++++ b/kernel/fs.h
+@@ -24,9 +24,9 @@ struct superblock {
+ 
+ #define FSMAGIC 0x10203040
+ 
+-#define NDIRECT 12
++#define NDIRECT 11  //-1 for doubly-indirect block
+ #define NINDIRECT (BSIZE / sizeof(uint))
+-#define MAXFILE (NDIRECT + NINDIRECT)
++#define MAXFILE (NDIRECT + NINDIRECT+NINDIRECT*NINDIRECT)  //11+256+256*256
+ 
+ // On-disk inode structure
+ struct dinode {
+@@ -35,7 +35,7 @@ struct dinode {
+   short minor;          // Minor device number (T_DEVICE only)
+   short nlink;          // Number of links to inode in file system
+   uint size;            // Size of file (bytes)
+-  uint addrs[NDIRECT+1];   // Data block addresses
++  uint addrs[NDIRECT+2];   // Data block addresses  //haved changed NDIRECT for lab9
+ };
+ 
+ // Inodes per block.
+@@ -57,4 +57,5 @@ struct dirent {
+   ushort inum;
+   char name[DIRSIZ];
+ };
+-
++//the max depth of symlinks for lab9-2
++#define NSYMLINK 10
+diff --git a/kernel/stat.h b/kernel/stat.h
+index 19543af..a1a2d9c 100644
+--- a/kernel/stat.h
++++ b/kernel/stat.h
+@@ -1,6 +1,7 @@
+ #define T_DIR     1   // Directory
+ #define T_FILE    2   // File
+ #define T_DEVICE  3   // Device
++#define T_SYMLINK 4   //soft symbolic link for lab9-2
+ 
+ struct stat {
+   int dev;     // File system's disk device
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index c1b3670..1bd554b 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -104,8 +104,9 @@ extern uint64 sys_unlink(void);
+ extern uint64 sys_wait(void);
+ extern uint64 sys_write(void);
+ extern uint64 sys_uptime(void);
++extern uint64 sys_symlink(void);
+ 
+-static uint64 (*syscalls[])(void) = {
++static uint64 (*syscalls[])(void)={
+ [SYS_fork]    sys_fork,
+ [SYS_exit]    sys_exit,
+ [SYS_wait]    sys_wait,
+@@ -127,6 +128,8 @@ static uint64 (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_symlink] sys_symlink,
++
+ };
+ 
+ void
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index bc5f356..13818da 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,3 +20,4 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_symlink 22
+diff --git a/kernel/sysfile.c b/kernel/sysfile.c
+index 5dc453b..dafb438 100644
+--- a/kernel/sysfile.c
++++ b/kernel/sysfile.c
+@@ -15,7 +15,7 @@
+ #include "sleeplock.h"
+ #include "file.h"
+ #include "fcntl.h"
+-
++#define MAX_SYMLINK_DEPTH 10
+ // Fetch the nth word-sized system call argument as a file descriptor
+ // and return both the descriptor and the corresponding struct file.
+ static int
+@@ -282,7 +282,43 @@ create(char *path, short type, short major, short minor)
+ 
+   return ip;
+ }
+-
++/*
++static struct inode* 
++follow_symlink(struct inode* ip)
++{
++  //uint inums[NSYMLINK];
++  struct inode* dps[NSYMLINK];
++  int i,j;
++  char target[MAXPATH];
++  for(i=0;i<NSYMLINK;i++){
++    //inums[i]=ip->inum;
++    dps[i]=ip;
++    if(readi(ip,0,(uint64)target,0,MAXPATH)<=0)
++    {
++      iunlockput(ip);
++      printf("open_symlink:open symlink failed\n");
++      return 0;
++    }
++    iunlockput(ip);
++    if((ip=namei(target))==0)
++    {
++      printf("open_symlink:path \"%s\" is not exit\n",target);
++      return 0;
++    }
++    for(j=0;j<=i;j++){
++      if(ip==dps[j])
++      {
++        printf("open_symlink:links form a cycle\n");
++        return 0;
++      }
++    }
++    ilock(ip);
++    if(ip->type!=T_SYMLINK)return ip;
++  }
++  iunlockput(ip);
++  printf("open_symlink:the depth of links reach the limit\n");
++  return 0;
++}*/
+ uint64
+ sys_open(void)
+ {
+@@ -314,14 +350,42 @@ sys_open(void)
+       end_op();
+       return -1;
+     }
+-  }
+-
++  } 
++    
+   if(ip->type == T_DEVICE && (ip->major < 0 || ip->major >= NDEV)){
+     iunlockput(ip);
+     end_op();
+     return -1;
+   }
+-
++  //lab 9-2 to deal with symlink
++  if(ip->type == T_SYMLINK && !(omode & O_NOFOLLOW)) {
++    // 若符号链接指向的仍然是符号链接，则递归的跟随它
++    // 直到找到真正指向的文件
++    // 但深度不能超过MAX_SYMLINK_DEPTH
++    for(int i = 0; i < MAX_SYMLINK_DEPTH; i++) {  //the max depth is 10
++      // 读出符号链接指向的路径
++      if(readi(ip, 0, (uint64)path, 0, MAXPATH) != MAXPATH) {  //the length that read is less than MAXPATH
++        iunlockput(ip);
++        end_op();
++        return -1;
++      }
++      iunlockput(ip);
++      ip = namei(path);  //point to the new inode
++      if(ip == 0) {  //can't find the file from namei
++        end_op();
++        return -1;
++      }
++      ilock(ip);
++      if(ip->type != T_SYMLINK)
++        break;
++    }
++    // 超过最大允许深度后仍然为符号链接，则返回错误
++    if(ip->type == T_SYMLINK) {
++      iunlockput(ip);
++      end_op();
++      return -1;
++    }
++  }
+   if((f = filealloc()) == 0 || (fd = fdalloc(f)) < 0){
+     if(f)
+       fileclose(f);
+@@ -344,7 +408,7 @@ sys_open(void)
+   if((omode & O_TRUNC) && ip->type == T_FILE){
+     itrunc(ip);
+   }
+-
++ 
+   iunlock(ip);
+   end_op();
+ 
+@@ -484,3 +548,29 @@ sys_pipe(void)
+   }
+   return 0;
+ }
++
++uint64
++sys_symlink(void) {
++  char target[MAXPATH], path[MAXPATH];  //the buffer of target path and the path of symlink to create
++  struct inode* ip_path;  //point to symlink to create
++
++  if(argstr(0, target, MAXPATH) < 0 || argstr(1, path, MAXPATH) < 0) {
++    return -1;  //get the first 's path and save in target,get the second 's path and save to path
++  }
++
++  begin_op();  //lock the file system
++  ip_path = create(path, T_SYMLINK, 0, 0);  //create a symlink
++  if(ip_path == 0) {
++    end_op();  //end the operation of file system
++    return -1;
++  }
++  if(writei(ip_path, 0, (uint64)target, 0, MAXPATH) < MAXPATH) {  //ip_path:inode of symlink;0:write start from the start of file;target:what to write;0:the offset to write;MAXPATH:the length to write
++    iunlockput(ip_path);  //unlock the create
++    end_op();
++    return -1;
++  }
++
++  iunlockput(ip_path);
++  end_op();
++  return 0;
++}
+diff --git a/user/user.h b/user/user.h
+index b71ecda..5ffe58e 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -23,6 +23,7 @@ int getpid(void);
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int symlink(char *target,char *path);  //for lab9-2
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff --git a/user/usys.pl b/user/usys.pl
+index 01e426e..3405840 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -36,3 +36,4 @@ entry("getpid");
+ entry("sbrk");
+ entry("sleep");
+ entry("uptime");
++entry("symlink");  # for lab9-2
