@@ -1,0 +1,20 @@
+diff --git a/Makefile b/Makefile
+index c926b7e..93b5f54 100644
+--- a/Makefile
++++ b/Makefile
+@@ -193,9 +193,12 @@ UPROGS=\
+ 	$U/_grind\
+ 	$U/_wc\
+ 	$U/_zombie\
+-
+-
+-
++        $U/_sleep\
++        $U/_pingpong\
++        $U/_primes\
++        $U/_prime\
++        $U/_find\
++        $U/_xargs\
+ 
+ ifeq ($(LAB),$(filter $(LAB), pgtbl lock))
+ UPROGS += \
