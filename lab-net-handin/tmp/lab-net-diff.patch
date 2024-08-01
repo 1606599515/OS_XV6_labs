@@ -1,0 +1,64 @@
+diff --git a/kernel/e1000.c b/kernel/e1000.c
+index 70a2adf..1bce903 100644
+--- a/kernel/e1000.c
++++ b/kernel/e1000.c
+@@ -93,7 +93,7 @@ e1000_init(uint32 *xregs)
+ }
+ 
+ int
+-e1000_transmit(struct mbuf *m)
++e1000_transmit(struct mbuf *m)  //get the Ethernet Frame
+ {
+   //
+   // Your code here.
+@@ -102,6 +102,21 @@ e1000_transmit(struct mbuf *m)
+   // the TX descriptor ring so that the e1000 sends it. Stash
+   // a pointer so that it can be freed after sending.
+   //
++  acquire(&e1000_lock);
++  uint32 tx_index=regs[E1000_TDT];  //get the send index
++  if((tx_ring[tx_index].status&E1000_TXD_STAT_DD)==0)  //the send index cannot be used
++  {
++    release(&e1000_lock);
++    return -1;
++  }
++  if(tx_mbufs[tx_index])  //check whether the index is used
++    mbuffree(tx_mbufs[tx_index]);  //release the last frame has been used
++  tx_mbufs[tx_index]=m;  //is using the frame
++  tx_ring[tx_index].addr=(uint64)m->head;  //the location to send
++  tx_ring[tx_index].length=m->len;  //the size to send
++  tx_ring[tx_index].cmd=E1000_TXD_CMD_EOP|E1000_TXD_CMD_RS;  //the end of frame and request to send
++  regs[E1000_TDT]=(tx_index+1)%TX_RING_SIZE;  //the next index to send
++  release(&e1000_lock);
+   
+   return 0;
+ }
+@@ -110,11 +125,24 @@ static void
+ e1000_recv(void)
+ {
+   //
+-  // Your code here.
++  // Your code here.S
+   //
+   // Check for packets that have arrived from the e1000
+   // Create and deliver an mbuf for each packet (using net_rx()).
+   //
++  while(1)  //receive all the frames
++  {
++    uint32 rx_index=(regs[E1000_RDT]+1)%RX_RING_SIZE;  //the next index to receive
++    if((rx_ring[rx_index].status&E1000_RXD_STAT_DD)==0)return;  //whether the frame to receive is prepared
++    rx_mbufs[rx_index]->len=rx_ring[rx_index].length;  //the length to receive
++    net_rx(rx_mbufs[rx_index]);  //pass to the upper layer protocol stack
++    
++    //to prepare the next recv
++    rx_mbufs[rx_index]=mbufalloc(0);  //create a new mbuf for next frame
++    rx_ring[rx_index].addr=(uint64)rx_mbufs[rx_index]->head;  //the location to receive
++    rx_ring[rx_index].status=0;  //set the index free,prepare to receive
++    regs[E1000_RDT]=rx_index;  //the next index to deal with
++  }
+ }
+ 
+ void
+diff --git a/packets.pcap b/packets.pcap
+index 82d353e..24547b0 100644
+Binary files a/packets.pcap and b/packets.pcap differ
